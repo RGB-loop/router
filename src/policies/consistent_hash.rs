@@ -317,6 +317,7 @@ impl ConsistentHashPolicy {
         "x-session-id",
         "x-user-id",
         "x-tenant-id",
+        "x-thread-id", // Common in multi-turn agent/chat scenarios
         "x-request-id",
         "x-correlation-id",
         "x-trace-id",
@@ -385,7 +386,7 @@ impl ConsistentHashPolicy {
     /// 3. Body: user field (OpenAI format)
     /// 4. Body: session_id (legacy)
     /// 5. Body: user_id (legacy)
-    /// 6. Fallback: hash of request body
+    /// 6. Fallback: random value for load balancing (prevents hotspotting)
     fn extract_hash_key(
         &self,
         request_text: Option<&str>,
@@ -403,13 +404,21 @@ impl ConsistentHashPolicy {
             return key;
         }
 
-        // 3. Final fallback: hash of request body
-        let text = request_text.unwrap_or("");
-        if text.len() > 100 {
-            format!("request_hash:{:016x}", Self::fbi_hash(text))
-        } else {
-            format!("request:{}", text)
-        }
+        // 3. Final fallback: generate random key for load balancing distribution
+        // This prevents hotspotting when no session identifier is found.
+        // In multi-turn agent scenarios with identical system prompts, hashing
+        // the request body would route all requests to the same worker.
+        // Using a random key ensures even distribution across workers.
+        let random_value = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            ^ (std::ptr::addr_of!(self) as u128); // Add pointer address for extra entropy
+        info!(
+            "CONSISTENT_HASH_DEBUG: No session identifier found, using random distribution (key=random:{})",
+            random_value
+        );
+        format!("random:{}", random_value)
     }
 
     /// Extract nested field value like session_params.session_id from JSON text

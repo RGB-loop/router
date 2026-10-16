@@ -40,6 +40,32 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
+/// Hop-by-hop request headers (RFC 9110 §7.6.1): they describe the client's
+/// connection to the router and must not be forwarded to the worker.
+const HOP_BY_HOP_REQUEST_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Lowercased field names listed in the request's Connection headers, which
+/// are hop-by-hop for this request as well.
+fn connection_listed_headers(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
         headers.insert("x-router-stages", value);
@@ -2582,7 +2608,17 @@ impl RouterTrait for Router {
         // Forward the client's headers (e.g. Authorization, anthropic-version)
         // like the typed routes do, in every mode rather than only EPD.
         if let Some(headers) = headers {
+            let connection_listed = connection_listed_headers(headers);
             for (name, value) in headers {
+                // Hop-by-hop headers, including any the client named in
+                // Connection, end at the router.
+                if HOP_BY_HOP_REQUEST_HEADERS.contains(&name.as_str())
+                    || connection_listed
+                        .iter()
+                        .any(|listed| listed == name.as_str())
+                {
+                    continue;
+                }
                 // When a backend api_key is configured it must win:
                 // RequestBuilder::header appends, and vLLM reads the
                 // first Authorization value.
@@ -2595,10 +2631,8 @@ impl RouterTrait for Router {
                 if worker.dp_rank().is_some() && name.as_str() == "x-data-parallel-rank" {
                     continue;
                 }
-                if !matches!(
-                    name.as_str(),
-                    "host" | "content-length" | "content-type" | "connection" | "transfer-encoding"
-                ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                if !matches!(name.as_str(), "host" | "content-length" | "content-type")
+                    && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
                 {
                     request_builder = request_builder.header(name, value);
                 }
@@ -2832,9 +2866,17 @@ mod tests {
         router: &Router,
         path: &str,
     ) -> HashMap<String, Vec<String>> {
+        transparent_echoed_headers_for(router, path, &client_request_headers()).await
+    }
+
+    async fn transparent_echoed_headers_for(
+        router: &Router,
+        path: &str,
+        headers: &HeaderMap,
+    ) -> HashMap<String, Vec<String>> {
         let response = router
             .route_transparent(
-                Some(&client_request_headers()),
+                Some(headers),
                 path,
                 &Method::POST,
                 serde_json::json!({"model": "m", "messages": [], "input": "hi"}),
@@ -2929,6 +2971,74 @@ mod tests {
                 "{context}"
             );
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_drops_hop_by_hop_request_headers() {
+        let mut headers = client_request_headers();
+        headers.insert(
+            "proxy-authorization",
+            "Basic cHJveHk6c2VjcmV0".parse().unwrap(),
+        );
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("trailer", "x-checksum".parse().unwrap());
+        headers.insert("upgrade", "h2c".parse().unwrap());
+        // Two Connection headers; the listed names differ in case and
+        // spacing from the actual header names.
+        headers.append("connection", "keep-alive, X-Private-Hop".parse().unwrap());
+        headers.append("connection", " Upgrade ,x-other-hop".parse().unwrap());
+        headers.insert("x-private-hop", "private".parse().unwrap());
+        headers.insert("x-other-hop", "other".parse().unwrap());
+        for api_key in [None, Some("router-key")] {
+            for epd in [false, true] {
+                let (router, server) = header_echo_router(api_key, epd, None).await;
+                let paths: &[&str] = if epd {
+                    &["/v1/chat/completions"]
+                } else {
+                    &["/v1/messages", "/custom"]
+                };
+                for path in paths {
+                    let echoed = transparent_echoed_headers_for(&router, path, &headers).await;
+                    let context = format!("api_key={api_key:?} epd={epd} {path}: {echoed:?}");
+                    for dropped in [
+                        "proxy-authorization",
+                        "connection",
+                        "keep-alive",
+                        "te",
+                        "trailer",
+                        "upgrade",
+                        "x-private-hop",
+                        "x-other-hop",
+                    ] {
+                        assert!(
+                            header_values(&echoed, dropped).is_empty(),
+                            "{dropped} forwarded; {context}"
+                        );
+                    }
+                    let authorization = match api_key {
+                        Some(key) => format!("Bearer {key}"),
+                        None => "Bearer client-key".to_string(),
+                    };
+                    assert_eq!(
+                        header_values(&echoed, "authorization"),
+                        [authorization.as_str()],
+                        "{context}"
+                    );
+                    assert_eq!(
+                        header_values(&echoed, "anthropic-version"),
+                        ["2023-06-01"],
+                        "{context}"
+                    );
+                    assert_eq!(
+                        header_values(&echoed, "x-custom-tenant"),
+                        ["tenant-a"],
+                        "{context}"
+                    );
+                }
+                server.abort();
+            }
         }
     }
 

@@ -32,7 +32,7 @@ use axum::{
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -54,8 +54,9 @@ const HOP_BY_HOP_REQUEST_HEADERS: &[&str] = &[
 ];
 
 /// Lowercased field names listed in the request's Connection headers, which
-/// are hop-by-hop for this request as well.
-fn connection_listed_headers(headers: &HeaderMap) -> Vec<String> {
+/// are hop-by-hop for this request as well. A set keeps matching linear in
+/// the number of headers even when Connection lists many options.
+fn connection_listed_headers(headers: &HeaderMap) -> HashSet<String> {
     headers
         .get_all(http::header::CONNECTION)
         .iter()
@@ -2613,9 +2614,7 @@ impl RouterTrait for Router {
                 // Hop-by-hop headers, including any the client named in
                 // Connection, end at the router.
                 if HOP_BY_HOP_REQUEST_HEADERS.contains(&name.as_str())
-                    || connection_listed
-                        .iter()
-                        .any(|listed| listed == name.as_str())
+                    || connection_listed.contains(name.as_str())
                 {
                     continue;
                 }

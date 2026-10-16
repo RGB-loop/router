@@ -2589,6 +2589,12 @@ impl RouterTrait for Router {
                 if self.api_key.is_some() && name == http::header::AUTHORIZATION {
                     continue;
                 }
+                // When the router selects a DP rank, it owns the
+                // X-data-parallel-rank header: skip any client-supplied
+                // value so the worker sees exactly one rank (ours).
+                if worker.dp_rank().is_some() && name.as_str() == "x-data-parallel-rank" {
+                    continue;
+                }
                 if !matches!(
                     name.as_str(),
                     "host" | "content-length" | "content-type" | "connection" | "transfer-encoding"
@@ -2773,6 +2779,7 @@ mod tests {
     async fn header_echo_router(
         api_key: Option<&str>,
         epd: bool,
+        dp_rank: Option<usize>,
     ) -> (Router, tokio::task::JoinHandle<()>) {
         let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
             let echoed: Vec<(String, String)> = headers
@@ -2786,9 +2793,11 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
-        router
-            .worker_registry
-            .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+        let worker: Arc<dyn Worker> = match dp_rank {
+            Some(rank) => Arc::new(DPAwareWorker::new(url, rank, 2, WorkerType::Regular)),
+            None => Arc::new(BasicWorker::new(url, WorkerType::Regular)),
+        };
+        router.worker_registry.register(worker);
         router.api_key = api_key.map(str::to_string);
         if epd {
             router.epd = Some(super::super::epd::EncoderStage::new(
@@ -2806,6 +2815,7 @@ mod tests {
         headers.insert("authorization", "Bearer client-key".parse().unwrap());
         headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
         headers.insert("x-custom-tenant", "tenant-a".parse().unwrap());
+        headers.insert("x-data-parallel-rank", "0".parse().unwrap());
         headers.insert("host", "client.example".parse().unwrap());
         headers.insert("content-length", "999".parse().unwrap());
         headers.insert("content-type", "text/plain".parse().unwrap());
@@ -2850,7 +2860,7 @@ mod tests {
     #[tokio::test]
     async fn test_route_transparent_forwards_client_headers_in_all_modes() {
         for epd in [false, true] {
-            let (router, server) = header_echo_router(None, epd).await;
+            let (router, server) = header_echo_router(None, epd, None).await;
             let paths: &[&str] = if epd {
                 &["/v1/chat/completions"]
             } else {
@@ -2900,7 +2910,7 @@ mod tests {
     #[tokio::test]
     async fn test_route_transparent_router_api_key_overrides_client_authorization() {
         for epd in [false, true] {
-            let (router, server) = header_echo_router(Some("router-key"), epd).await;
+            let (router, server) = header_echo_router(Some("router-key"), epd, None).await;
             let path = if epd {
                 "/v1/chat/completions"
             } else {
@@ -2916,6 +2926,31 @@ mod tests {
             assert_eq!(
                 header_values(&echoed, "anthropic-version"),
                 ["2023-06-01"],
+                "{context}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_router_dp_rank_overrides_client_dp_rank() {
+        for epd in [false, true] {
+            let (router, server) = header_echo_router(None, epd, Some(1)).await;
+            let path = if epd {
+                "/v1/chat/completions"
+            } else {
+                "/v1/responses"
+            };
+            let echoed = transparent_echoed_headers(&router, path).await;
+            let context = format!("epd={epd} {path}: {echoed:?}");
+            assert_eq!(
+                header_values(&echoed, "x-data-parallel-rank"),
+                ["1"],
+                "{context}"
+            );
+            assert_eq!(
+                header_values(&echoed, "authorization"),
+                ["Bearer client-key"],
                 "{context}"
             );
             server.abort();

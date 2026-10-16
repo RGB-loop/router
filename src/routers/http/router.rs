@@ -2579,27 +2579,22 @@ impl RouterTrait for Router {
             request_builder = request_builder.json(&body);
         }
 
-        // Add authorization if configured
-        if self.epd.is_some() {
-            if let Some(headers) = headers {
-                for (name, value) in headers {
-                    // When a backend api_key is configured it must win:
-                    // RequestBuilder::header appends, and vLLM reads the
-                    // first Authorization value.
-                    if self.api_key.is_some() && name == http::header::AUTHORIZATION {
-                        continue;
-                    }
-                    if !matches!(
-                        name.as_str(),
-                        "host"
-                            | "content-length"
-                            | "content-type"
-                            | "connection"
-                            | "transfer-encoding"
-                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
-                    {
-                        request_builder = request_builder.header(name, value);
-                    }
+        // Forward the client's headers (e.g. Authorization, anthropic-version)
+        // like the typed routes do, in every mode rather than only EPD.
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                // When a backend api_key is configured it must win:
+                // RequestBuilder::header appends, and vLLM reads the
+                // first Authorization value.
+                if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                    continue;
+                }
+                if !matches!(
+                    name.as_str(),
+                    "host" | "content-length" | "content-type" | "connection" | "transfer-encoding"
+                ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                {
+                    request_builder = request_builder.header(name, value);
                 }
             }
         }
@@ -2772,6 +2767,160 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Start a worker that echoes every request header value it receives and
+    /// return a router whose only worker is that echo server.
+    async fn header_echo_router(
+        api_key: Option<&str>,
+        epd: bool,
+    ) -> (Router, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let echoed: Vec<(String, String)> = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+                .collect();
+            Json(echoed)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+        router.api_key = api_key.map(str::to_string);
+        if epd {
+            router.epd = Some(super::super::epd::EncoderStage::new(
+                crate::config::EpdConfig {
+                    encoder_urls: vec!["http://unused".into()],
+                    consumer_zmq_addrs: Default::default(),
+                },
+            ));
+        }
+        (router, server)
+    }
+
+    fn client_request_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer client-key".parse().unwrap());
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert("x-custom-tenant", "tenant-a".parse().unwrap());
+        headers.insert("host", "client.example".parse().unwrap());
+        headers.insert("content-length", "999".parse().unwrap());
+        headers.insert("content-type", "text/plain".parse().unwrap());
+        headers.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    async fn transparent_echoed_headers(
+        router: &Router,
+        path: &str,
+    ) -> HashMap<String, Vec<String>> {
+        let response = router
+            .route_transparent(
+                Some(&client_request_headers()),
+                path,
+                &Method::POST,
+                serde_json::json!({"model": "m", "messages": [], "input": "hi"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let pairs: Vec<(String, String)> = serde_json::from_slice(&bytes).unwrap();
+        let mut echoed: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, value) in pairs {
+            echoed.entry(name).or_default().push(value);
+        }
+        echoed
+    }
+
+    fn header_values<'a>(echoed: &'a HashMap<String, Vec<String>>, name: &str) -> Vec<&'a str> {
+        echoed
+            .get(name)
+            .map(|values| values.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_forwards_client_headers_in_all_modes() {
+        for epd in [false, true] {
+            let (router, server) = header_echo_router(None, epd).await;
+            let paths: &[&str] = if epd {
+                &["/v1/chat/completions"]
+            } else {
+                &["/v1/responses", "/v1/messages", "/custom"]
+            };
+            for path in paths {
+                let echoed = transparent_echoed_headers(&router, path).await;
+                let context = format!("epd={epd} {path}: {echoed:?}");
+                assert_eq!(
+                    header_values(&echoed, "authorization"),
+                    ["Bearer client-key"],
+                    "{context}"
+                );
+                assert_eq!(
+                    header_values(&echoed, "anthropic-version"),
+                    ["2023-06-01"],
+                    "{context}"
+                );
+                assert_eq!(
+                    header_values(&echoed, "x-custom-tenant"),
+                    ["tenant-a"],
+                    "{context}"
+                );
+                // Still filtered: the router sets its own Host, body framing
+                // and JSON content type, and propagates trace context once.
+                assert_ne!(
+                    header_values(&echoed, "host"),
+                    ["client.example"],
+                    "{context}"
+                );
+                assert_eq!(
+                    header_values(&echoed, "content-type"),
+                    ["application/json"],
+                    "{context}"
+                );
+                assert_ne!(
+                    header_values(&echoed, "content-length"),
+                    ["999"],
+                    "{context}"
+                );
+                assert_eq!(header_values(&echoed, "traceparent").len(), 1, "{context}");
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_router_api_key_overrides_client_authorization() {
+        for epd in [false, true] {
+            let (router, server) = header_echo_router(Some("router-key"), epd).await;
+            let path = if epd {
+                "/v1/chat/completions"
+            } else {
+                "/v1/messages"
+            };
+            let echoed = transparent_echoed_headers(&router, path).await;
+            let context = format!("epd={epd} {path}: {echoed:?}");
+            assert_eq!(
+                header_values(&echoed, "authorization"),
+                ["Bearer router-key"],
+                "{context}"
+            );
+            assert_eq!(
+                header_values(&echoed, "anthropic-version"),
+                ["2023-06-01"],
+                "{context}"
+            );
+            server.abort();
+        }
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries

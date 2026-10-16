@@ -2991,9 +2991,10 @@ mod tests {
         headers.append("connection", " Upgrade ,x-other-hop".parse().unwrap());
         headers.insert("x-private-hop", "private".parse().unwrap());
         headers.insert("x-other-hop", "other".parse().unwrap());
-        for api_key in [None, Some("router-key")] {
+        for router_configured in [false, true] {
             for epd in [false, true] {
-                let (router, server) = header_echo_router(api_key, epd, None).await;
+                let (router, server) =
+                    header_echo_router(router_configured.then_some("router-key"), epd, None).await;
                 let paths: &[&str] = if epd {
                     &["/v1/chat/completions"]
                 } else {
@@ -3001,7 +3002,9 @@ mod tests {
                 };
                 for path in paths {
                     let echoed = transparent_echoed_headers_for(&router, path, &headers).await;
-                    let context = format!("api_key={api_key:?} epd={epd} {path}: {echoed:?}");
+                    let context = format!(
+                        "router_configured={router_configured} epd={epd} {path}: {echoed:?}"
+                    );
                     for dropped in [
                         "proxy-authorization",
                         "connection",
@@ -3017,13 +3020,14 @@ mod tests {
                             "{dropped} forwarded; {context}"
                         );
                     }
-                    let authorization = match api_key {
-                        Some(key) => format!("Bearer {key}"),
-                        None => "Bearer client-key".to_string(),
+                    let expected_bearer = if router_configured {
+                        "Bearer router-key"
+                    } else {
+                        "Bearer client-key"
                     };
                     assert_eq!(
                         header_values(&echoed, "authorization"),
-                        [authorization.as_str()],
+                        [expected_bearer],
                         "{context}"
                     );
                     assert_eq!(

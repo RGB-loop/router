@@ -3030,10 +3030,10 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
-                // Keep the circuit breaker informed, as the typed path does:
-                // 2xx/4xx count as success, 5xx as worker failure.
+                // Keep the circuit breaker informed: only 5xx is a worker
+                // failure. A 304 answering a forwarded conditional GET is not.
                 let was_available = worker.is_available();
-                worker.record_outcome(status.is_success() || status.is_client_error());
+                worker.record_outcome(!status.is_server_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
                 }
@@ -3562,6 +3562,41 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_not_modified_keeps_worker_available() {
+        // Forwarded conditional headers let a worker answer 304; repeated
+        // revalidations must not open the circuit breaker.
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            if headers.contains_key("if-none-match") {
+                StatusCode::NOT_MODIFIED.into_response()
+            } else {
+                StatusCode::OK.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+        router.worker_registry.register(worker.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", "\"v1\"".parse().unwrap());
+        for _ in 0..10 {
+            let response = router
+                .route_transparent(
+                    Some(&headers),
+                    "/static/app.js",
+                    &Method::GET,
+                    serde_json::Value::Null,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        }
+        assert!(worker.is_available());
+        server.abort();
     }
 
     struct HttpKvFixture {
